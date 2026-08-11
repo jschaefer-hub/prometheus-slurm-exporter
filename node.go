@@ -16,6 +16,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>. */
 package main
 
 import (
+	"fmt"
 	"log"
 	"os/exec"
 	"regexp"
@@ -28,46 +29,206 @@ import (
 
 // NodeMetrics stores metrics for each node
 type NodeMetrics struct {
-	memAlloc      uint64
-	memTotal      uint64
-	cpuAlloc      uint64
-	cpuIdle       uint64
-	cpuOther      uint64
-	cpuTotal      uint64
-	nodeStatus    string
-	nodeStateFull string
-	nodeReason    string
+	memAlloc        uint64
+	memTotal        uint64
+	cpuAlloc        uint64
+	cpuIdle         uint64
+	cpuOther        uint64
+	cpuTotal        uint64
+	nodeStatus      string
+	nodeStateFull   string
+	nodeReason      string
+	nodeReservation string
 }
 
 var (
-	nodeNameRegex   = regexp.MustCompile(`NodeName=(\S+)`)
-	nodeStateRegex  = regexp.MustCompile(`\bState=(\S+)`)
-	nodeReasonRegex = regexp.MustCompile(`Reason=(.*?)(?:\s*\[|$)`)
+	nodeNameRegex        = regexp.MustCompile(`NodeName=(\S+)`)
+	nodeStateRegex       = regexp.MustCompile(`\bState=(\S+)`)
+	nodeReasonRegex      = regexp.MustCompile(`Reason=(.*?)(?:\s*\[|$)`)
+	nodeReservationRegex = regexp.MustCompile(`ReservationName=(\S+)`)
+	resNameRegex         = regexp.MustCompile(`ReservationName=(\S+)`)
+	resNodesRegex        = regexp.MustCompile(`Nodes=(\S+)`)
 )
 
 // nodeState holds the state flags and reason parsed from 'scontrol show node'
 type nodeState struct {
-	status string
-	reason string
+	status      string
+	reason      string
+	reservation string
 }
 
 func NodeGetMetrics() map[string]*NodeMetrics {
 	nodes := ParseNodeMetrics(NodeData())
 	states := ParseNodeStates(NodeStateData())
+	reservations := ParseNodeReservations(NodeReservationData())
 
 	for name, metrics := range nodes {
 		if state, ok := states[name]; ok {
 			metrics.nodeStateFull = state.status
 			metrics.nodeReason = state.reason
+			if state.reservation != "" {
+				metrics.nodeReservation = state.reservation
+			}
+		}
+		if res, ok := reservations[name]; ok && res != "" {
+			if metrics.nodeReservation == "" {
+				metrics.nodeReservation = res
+			} else {
+				resList := strings.Split(metrics.nodeReservation, ",")
+				for _, r := range strings.Split(res, ",") {
+					resList = append(resList, r)
+				}
+				sort.Strings(resList)
+				metrics.nodeReservation = strings.Join(RemoveDuplicates(resList), ",")
+			}
 		}
 	}
 
 	return nodes
 }
 
+// ExpandHostlist expands a Slurm node range expression like "node[01-03,05],node08"
+// into individual node names ["node01", "node02", "node03", "node05", "node08"]
+func ExpandHostlist(hostlist string) []string {
+	hostlist = strings.TrimSpace(hostlist)
+	if hostlist == "" || hostlist == "(null)" || hostlist == "ALL" {
+		return nil
+	}
+
+	// Split top-level commas (avoiding commas inside brackets)
+	var topItems []string
+	var current strings.Builder
+	bracketDepth := 0
+
+	for _, char := range hostlist {
+		switch char {
+		case '[':
+			bracketDepth++
+			current.WriteRune(char)
+		case ']':
+			bracketDepth--
+			current.WriteRune(char)
+		case ',':
+			if bracketDepth == 0 {
+				if current.Len() > 0 {
+					topItems = append(topItems, current.String())
+					current.Reset()
+				}
+			} else {
+				current.WriteRune(char)
+			}
+		default:
+			current.WriteRune(char)
+		}
+	}
+	if current.Len() > 0 {
+		topItems = append(topItems, current.String())
+	}
+
+	var result []string
+	for _, item := range topItems {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+
+		openIdx := strings.Index(item, "[")
+		closeIdx := strings.Index(item, "]")
+
+		if openIdx != -1 && closeIdx != -1 && closeIdx > openIdx {
+			prefix := item[:openIdx]
+			inside := item[openIdx+1 : closeIdx]
+			suffix := item[closeIdx+1:]
+
+			parts := strings.Split(inside, ",")
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+
+				if strings.Contains(part, "-") {
+					rangeParts := strings.Split(part, "-")
+					if len(rangeParts) == 2 {
+						startStr := strings.TrimSpace(rangeParts[0])
+						endStr := strings.TrimSpace(rangeParts[1])
+						startNum, err1 := strconv.Atoi(startStr)
+						endNum, err2 := strconv.Atoi(endStr)
+
+						if err1 == nil && err2 == nil && startNum <= endNum {
+							width := len(startStr)
+							for i := startNum; i <= endNum; i++ {
+								numStr := fmt.Sprintf("%0*d", width, i)
+								expandedSuffixes := ExpandHostlist(prefix + numStr + suffix)
+								result = append(result, expandedSuffixes...)
+							}
+							continue
+						}
+					}
+				}
+
+				expandedSuffixes := ExpandHostlist(prefix + part + suffix)
+				result = append(result, expandedSuffixes...)
+			}
+		} else {
+			result = append(result, item)
+		}
+	}
+
+	return result
+}
+
+// ParseNodeReservations takes the output of 'scontrol show reservation -o' and returns a
+// map of node name to its comma-separated, lowercased/sorted reservation names.
+func ParseNodeReservations(input []byte) map[string]string {
+	reservations := make(map[string][]string)
+	lines := strings.Split(string(input), "\n")
+
+	for _, line := range lines {
+		if len(strings.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		nameMatch := resNameRegex.FindStringSubmatch(line)
+		nodesMatch := resNodesRegex.FindStringSubmatch(line)
+		if nameMatch == nil || nodesMatch == nil {
+			continue
+		}
+
+		resName := nameMatch[1]
+		nodesStr := nodesMatch[1]
+		if resName == "" || resName == "(null)" || nodesStr == "" || nodesStr == "(null)" {
+			continue
+		}
+
+		nodeList := ExpandHostlist(nodesStr)
+		for _, nodeName := range nodeList {
+			reservations[nodeName] = append(reservations[nodeName], resName)
+		}
+	}
+
+	result := make(map[string]string)
+	for nodeName, resList := range reservations {
+		sort.Strings(resList)
+		result[nodeName] = strings.Join(RemoveDuplicates(resList), ",")
+	}
+
+	return result
+}
+
+// NodeReservationData executes 'scontrol show reservation -o' to get reservation details
+func NodeReservationData() []byte {
+	cmd := exec.Command("scontrol", "show", "reservation", "-o")
+	out, err := cmd.Output()
+	if err != nil {
+		return []byte{}
+	}
+	return out
+}
+
 // ParseNodeStates takes the output of 'scontrol show node -o' and returns a
 // map of node name to its comma-separated, lowercased state flags (e.g.
-// "idle,maintenance,powered_down,reserved") along with its reason, if any.
+// "idle,maintenance,powered_down,reserved") along with its reason and reservation, if any.
 func ParseNodeStates(input []byte) map[string]nodeState {
 	states := make(map[string]nodeState)
 	lines := strings.Split(string(input), "\n")
@@ -98,7 +259,15 @@ func ParseNodeStates(input []byte) map[string]nodeState {
 			reason = strings.ReplaceAll(reason, " ", "_")
 		}
 
-		states[nodeName] = nodeState{status: status, reason: reason}
+		reservation := ""
+		if resMatch := nodeReservationRegex.FindStringSubmatch(line); resMatch != nil {
+			resVal := strings.TrimSpace(resMatch[1])
+			if resVal != "(null)" && resVal != "N/A" {
+				reservation = resVal
+			}
+		}
+
+		states[nodeName] = nodeState{status: status, reason: reason, reservation: reservation}
 	}
 
 	return states
@@ -130,11 +299,10 @@ func ParseNodeMetrics(input []byte) map[string]*NodeMetrics {
 		nodeName := node[0]
 		nodeStatus := node[4] // mixed, allocated, etc.
 
-		nodes[nodeName] = &NodeMetrics{0, 0, 0, 0, 0, 0, "", "", ""}
+		nodes[nodeName] = &NodeMetrics{0, 0, 0, 0, 0, 0, "", "", "", ""}
 
 		memAlloc, _ := strconv.ParseUint(node[1], 10, 64)
 		memTotal, _ := strconv.ParseUint(node[2], 10, 64)
-
 
 		cpuInfo := strings.Split(node[3], "/")
 		cpuAlloc, _ := strconv.ParseUint(cpuInfo[0], 10, 64)
@@ -177,7 +345,7 @@ type NodeCollector struct {
 // NewNodeCollector creates a Prometheus collector to keep all our stats in
 // It returns a set of collections for consumption
 func NewNodeCollector() *NodeCollector {
-	labels := []string{"node", "status", "state_full", "reason"}
+	labels := []string{"node", "status", "state_full", "reason", "reservations"}
 
 	return &NodeCollector{
 		cpuAlloc: prometheus.NewDesc("slurm_node_cpu_alloc", "Allocated CPUs per node", labels, nil),
@@ -202,11 +370,11 @@ func (nc *NodeCollector) Describe(ch chan<- *prometheus.Desc) {
 func (nc *NodeCollector) Collect(ch chan<- prometheus.Metric) {
 	nodes := NodeGetMetrics()
 	for node := range nodes {
-		ch <- prometheus.MustNewConstMetric(nc.cpuAlloc, prometheus.GaugeValue, float64(nodes[node].cpuAlloc), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason)
-		ch <- prometheus.MustNewConstMetric(nc.cpuIdle, prometheus.GaugeValue, float64(nodes[node].cpuIdle), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason)
-		ch <- prometheus.MustNewConstMetric(nc.cpuOther, prometheus.GaugeValue, float64(nodes[node].cpuOther), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason)
-		ch <- prometheus.MustNewConstMetric(nc.cpuTotal, prometheus.GaugeValue, float64(nodes[node].cpuTotal), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason)
-		ch <- prometheus.MustNewConstMetric(nc.memAlloc, prometheus.GaugeValue, float64(nodes[node].memAlloc), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason)
-		ch <- prometheus.MustNewConstMetric(nc.memTotal, prometheus.GaugeValue, float64(nodes[node].memTotal), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason)
+		ch <- prometheus.MustNewConstMetric(nc.cpuAlloc, prometheus.GaugeValue, float64(nodes[node].cpuAlloc), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason, nodes[node].nodeReservation)
+		ch <- prometheus.MustNewConstMetric(nc.cpuIdle, prometheus.GaugeValue, float64(nodes[node].cpuIdle), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason, nodes[node].nodeReservation)
+		ch <- prometheus.MustNewConstMetric(nc.cpuOther, prometheus.GaugeValue, float64(nodes[node].cpuOther), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason, nodes[node].nodeReservation)
+		ch <- prometheus.MustNewConstMetric(nc.cpuTotal, prometheus.GaugeValue, float64(nodes[node].cpuTotal), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason, nodes[node].nodeReservation)
+		ch <- prometheus.MustNewConstMetric(nc.memAlloc, prometheus.GaugeValue, float64(nodes[node].memAlloc), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason, nodes[node].nodeReservation)
+		ch <- prometheus.MustNewConstMetric(nc.memTotal, prometheus.GaugeValue, float64(nodes[node].memTotal), node, nodes[node].nodeStatus, nodes[node].nodeStateFull, nodes[node].nodeReason, nodes[node].nodeReservation)
 	}
 }
